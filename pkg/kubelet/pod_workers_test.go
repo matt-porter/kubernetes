@@ -54,6 +54,7 @@ func createPodWorkers() (*podWorkers, map[types.UID][]string) {
 	processed := make(map[types.UID][]string)
 	fakeRecorder := &record.FakeRecorder{}
 	fakeRuntimeCache := createFakeRuntimeCache(fakeRecorder)
+	const probeInterval = time.Second * 10
 	podWorkers := newPodWorkers(
 		fakeRuntimeCache,
 		func(pod *api.Pod, mirrorPod *api.Pod, runningPod kubecontainer.Pod, updateType SyncPodType) error {
@@ -65,6 +66,7 @@ func createPodWorkers() (*podWorkers, map[types.UID][]string) {
 			return nil
 		},
 		fakeRecorder,
+		probeInterval,
 	)
 	return podWorkers, processed
 }

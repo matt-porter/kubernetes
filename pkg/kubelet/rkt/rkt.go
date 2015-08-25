@@ -1027,12 +1027,17 @@ func (r *runtime) SyncPod(pod *api.Pod, runningPod kubecontainer.Pod, podStatus 
 	}
 
 	if restartPod {
-		if err := r.KillPod(pod, runningPod); err != nil {
-			return err
-		}
-		if err := r.RunPod(pod, pullSecrets); err != nil {
-			return err
-		}
+		return r.RestartContainers(pod, runningPod, []string{}, api.PodStatus{}, pullSecrets, backOff)
+	}
+	return nil
+}
+
+func (r *runtime) RestartContainers(pod *api.Pod, runningPod kubecontainer.Pod, containerNames []string, _ api.PodStatus, pullSecrets []api.Secret, _ *util.Backoff) error {
+	if err := r.KillPod(pod, runningPod); err != nil {
+		return err
+	}
+	if err := r.RunPod(pod, pullSecrets); err != nil {
+		return err
 	}
 	return nil
 }

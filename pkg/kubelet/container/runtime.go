@@ -80,6 +80,8 @@ type Runtime interface {
 	// stream the log. Set 'follow' to false and specify the number of lines (e.g.
 	// "100" or "all") to tail the log.
 	GetContainerLogs(pod *api.Pod, containerID, tail string, follow bool, stdout, stderr io.Writer) (err error)
+	// RestartContainers kills specified containers if necessary, and then starts all the specified containers.
+	RestartContainers(pod *api.Pod, runningPod Pod, containerNames []string, podStatus api.PodStatus, pullSecrets []api.Secret, backOff *util.Backoff) error
 	// ContainerCommandRunner encapsulates the command runner interfaces for testability.
 	ContainerCommandRunner
 	// ContainerAttach encapsulates the attaching to containers for testability

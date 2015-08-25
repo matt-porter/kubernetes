@@ -97,7 +97,7 @@ func (pb *prober) Probe(pod *api.Pod, status api.PodStatus, container api.Contai
 	return pb.probeLiveness(pod, status, container, containerID, createdAt)
 }
 
-// probeLiveness probes the liveness of a container.
+// ProbeLiveness probes the liveness of a container.
 // If the initalDelay since container creation on liveness probe has not passed the probe will return probe.Success.
 func (pb *prober) probeLiveness(pod *api.Pod, status api.PodStatus, container api.Container, containerID string, createdAt int64) (probe.Result, error) {
 	var live probe.Result
@@ -137,7 +137,7 @@ func (pb *prober) probeLiveness(pod *api.Pod, status api.PodStatus, container ap
 	return probe.Success, nil
 }
 
-// probeReadiness probes and sets the readiness of a container.
+// ProbeReadiness probes and sets the readiness of a container.
 // If the initial delay on the readiness probe has not passed, we set readiness to false.
 func (pb *prober) probeReadiness(pod *api.Pod, status api.PodStatus, container api.Container, containerID string, createdAt int64) {
 	var ready probe.Result
