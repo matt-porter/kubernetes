@@ -51,10 +51,12 @@ import (
 	"k8s.io/kubernetes/pkg/kubelet/envvars"
 	"k8s.io/kubernetes/pkg/kubelet/metrics"
 	"k8s.io/kubernetes/pkg/kubelet/network"
+	"k8s.io/kubernetes/pkg/kubelet/prober"
 	"k8s.io/kubernetes/pkg/kubelet/rkt"
 	kubeletTypes "k8s.io/kubernetes/pkg/kubelet/types"
 	kubeletUtil "k8s.io/kubernetes/pkg/kubelet/util"
 	"k8s.io/kubernetes/pkg/labels"
+	"k8s.io/kubernetes/pkg/probe"
 	"k8s.io/kubernetes/pkg/runtime"
 	"k8s.io/kubernetes/pkg/types"
 	"k8s.io/kubernetes/pkg/util"
@@ -362,13 +364,14 @@ func NewMainKubelet(
 
 	klet.runner = klet.containerRuntime
 	klet.podManager = newBasicPodManager(klet.kubeClient)
+	klet.prober = prober.New(klet.runner, readinessManager, containerRefManager, recorder)
 
 	runtimeCache, err := kubecontainer.NewRuntimeCache(klet.containerRuntime)
 	if err != nil {
 		return nil, err
 	}
 	klet.runtimeCache = runtimeCache
-	klet.podWorkers = newPodWorkers(runtimeCache, klet.syncPod, recorder)
+	klet.podWorkers = newPodWorkers(runtimeCache, klet.syncPod, klet.probePod, recorder, klet.resyncInterval)
 
 	metrics.Register(runtimeCache)
 
@@ -465,6 +468,9 @@ type Kubelet struct {
 
 	// Container readiness state manager.
 	readinessManager *kubecontainer.ReadinessManager
+
+	// Health check prober.
+	prober prober.Prober
 
 	// How long to keep idle streaming command execution/port forwarding
 	// connections open before terminating them
@@ -1331,6 +1337,43 @@ func (kl *Kubelet) syncPod(pod *api.Pod, mirrorPod *api.Pod, runningPod kubecont
 		}
 	}
 	return nil
+}
+
+// probePod probes (liveness and readiness) the containers in the pod, and restarts
+func (kl *Kubelet) probePod(pod *api.Pod, runningPod kubecontainer.Pod) error {
+	podStatus, err := kl.generatePodStatus(pod)
+	if err != nil {
+		glog.Errorf("Unable to get status for pod %q: %v", pod.UID, err)
+		return err
+	}
+
+	// Names of containers requiring restart.
+	containersToRestart := []string{}
+	for _, container := range pod.Spec.Containers {
+		runningContainer := runningPod.FindContainerByName(container.Name)
+		result, err := kl.prober.Probe(pod, podStatus, container,
+			string(runningContainer.ID), runningContainer.Created)
+		if err != nil {
+			glog.Errorf("Failed to proby container %q: %v", container.Name, err)
+		} else if result == probe.Success {
+			glog.V(4).Infof("probe success: %q", container.Name)
+		} else {
+			glog.Infof("pod %q container %q is unhealthy (probe result: %v), it will be killed and re-created.",
+				kubecontainer.GetPodFullName(pod), container.Name, result)
+			if kubecontainer.ShouldContainerBeRestarted(&container, pod, &podStatus, kl.readinessManager) {
+				containersToRestart = append(containersToRestart, container.Name)
+			}
+		}
+	}
+
+	if len(containersToRestart) == 0 {
+		return nil
+	}
+	pullSecrets, err := kl.getPullSecretsForPod(pod)
+	if err != nil {
+		return err
+	}
+	return kl.containerRuntime.RestartContainers(pod, runningPod, containersToRestart, podStatus, pullSecrets, kl.backOff)
 }
 
 // getPullSecretsForPod inspects the Pod and retrieves the referenced pull secrets

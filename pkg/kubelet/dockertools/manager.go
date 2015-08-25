@@ -42,10 +42,8 @@ import (
 	"k8s.io/kubernetes/pkg/kubelet/lifecycle"
 	"k8s.io/kubernetes/pkg/kubelet/metrics"
 	"k8s.io/kubernetes/pkg/kubelet/network"
-	"k8s.io/kubernetes/pkg/kubelet/prober"
 	"k8s.io/kubernetes/pkg/kubelet/qos"
 	kubeletTypes "k8s.io/kubernetes/pkg/kubelet/types"
-	"k8s.io/kubernetes/pkg/probe"
 	"k8s.io/kubernetes/pkg/securitycontext"
 	"k8s.io/kubernetes/pkg/types"
 	"k8s.io/kubernetes/pkg/util"
@@ -114,9 +112,6 @@ type DockerManager struct {
 
 	// Network plugin.
 	networkPlugin network.NetworkPlugin
-
-	// Health check prober.
-	prober prober.Prober
 
 	// Generator of runtime container options.
 	generator kubecontainer.RunContainerOptionsGenerator
@@ -196,14 +191,12 @@ func NewDockerManager(
 		dockerRoot:             dockerRoot,
 		containerLogsDir:       containerLogsDir,
 		networkPlugin:          networkPlugin,
-		prober:                 nil,
 		generator:              generator,
 		execHandler:            execHandler,
 		oomAdjuster:            oomAdjuster,
 		procFs:                 procFs,
 	}
 	dm.runner = lifecycle.NewHandlerRunner(httpClient, dm, dm)
-	dm.prober = prober.New(dm, readinessManager, containerRefManager, recorder)
 	dm.imagePuller = kubecontainer.NewImagePuller(recorder, dm)
 
 	return dm
@@ -1502,6 +1495,12 @@ func (dm *DockerManager) createPodInfraContainer(pod *api.Pod) (kubeletTypes.Doc
 		return "", err
 	}
 
+	// Call the networking plugin
+	if err := dm.networkPlugin.SetUpPod(pod.Namespace, pod.Name, id); err != nil {
+		glog.Errorf("Failed to set up infra container networking on pod %q: %v", pod.Name, err)
+		return "", err
+	}
+
 	return id, nil
 }
 
@@ -1583,7 +1582,7 @@ func (dm *DockerManager) computePodContainerChanges(pod *api.Pod, runningPod kub
 
 		if createPodInfraContainer {
 			// createPodInfraContainer == true and Container exists
-			// If we're creating infra containere everything will be killed anyway
+			// If we're creating infra container everything will be killed anyway
 			// If RestartPolicy is Always or OnFailure we restart containers that were running before we
 			// killed them when restarting Infra Container.
 			if pod.Spec.RestartPolicy != api.RestartPolicyNever {
@@ -1602,20 +1601,7 @@ func (dm *DockerManager) computePodContainerChanges(pod *api.Pod, runningPod kub
 			continue
 		}
 
-		result, err := dm.prober.Probe(pod, podStatus, container, string(c.ID), c.Created)
-		if err != nil {
-			// TODO(vmarmol): examine this logic.
-			glog.V(2).Infof("probe no-error: %q", container.Name)
-			containersToKeep[containerID] = index
-			continue
-		}
-		if result == probe.Success {
-			glog.V(4).Infof("probe success: %q", container.Name)
-			containersToKeep[containerID] = index
-			continue
-		}
-		glog.Infof("pod %q container %q is unhealthy (probe result: %v), it will be killed and re-created.", podFullName, container.Name, result)
-		containersToStart[index] = empty{}
+		containersToKeep[containerID] = index
 	}
 
 	// After the loop one of the following should be true:
@@ -1650,6 +1636,7 @@ func (dm *DockerManager) clearReasonCache(pod *api.Pod, container *api.Container
 	dm.reasonCache.Remove(pod.UID, container.Name)
 }
 
+// TODO: Reduce duplicate code with RestartContainers. Consider calling RestartContainers from SyncPod.
 // Sync the running pod to match the specified desired pod.
 func (dm *DockerManager) SyncPod(pod *api.Pod, runningPod kubecontainer.Pod, podStatus api.PodStatus, pullSecrets []api.Secret, backOff *util.Backoff) error {
 	start := time.Now()
@@ -1703,11 +1690,6 @@ func (dm *DockerManager) SyncPod(pod *api.Pod, runningPod kubecontainer.Pod, pod
 	if containerChanges.StartInfraContainer && (len(containerChanges.ContainersToStart) > 0) {
 		glog.V(4).Infof("Creating pod infra container for %q", podFullName)
 		podInfraContainerID, err = dm.createPodInfraContainer(pod)
-
-		// Call the networking plugin
-		if err == nil {
-			err = dm.networkPlugin.SetUpPod(pod.Namespace, pod.Name, podInfraContainerID)
-		}
 		if err != nil {
 			glog.Errorf("Failed to create pod infra container: %v; Skipping pod %q", err, podFullName)
 			return err
@@ -1724,37 +1706,112 @@ func (dm *DockerManager) SyncPod(pod *api.Pod, runningPod kubecontainer.Pod, pod
 			glog.V(4).Infof("Backing Off restarting container %+v in pod %v", container, podFullName)
 			continue
 		}
-		glog.V(4).Infof("Creating container %+v in pod %v", container, podFullName)
-		err := dm.imagePuller.PullImage(pod, container, pullSecrets)
-		dm.updateReasonCache(pod, container, err)
+		err = dm.startContainer(pod, container, pullSecrets, podInfraContainerID)
 		if err != nil {
-			glog.Warningf("Failed to pull image %q from pod %q and container %q: %v", container.Image, kubecontainer.GetPodFullName(pod), container.Name, err)
-			continue
+			glog.Errorf("Error starting container: %v", err)
 		}
-
-		if container.SecurityContext != nil && container.SecurityContext.RunAsNonRoot {
-			err := dm.verifyNonRoot(container)
-			dm.updateReasonCache(pod, container, err)
-			if err != nil {
-				glog.Errorf("Error running pod %q container %q: %v", kubecontainer.GetPodFullName(pod), container.Name, err)
-				continue
-			}
-		}
-
-		// TODO(dawnchen): Check RestartPolicy.DelaySeconds before restart a container
-		namespaceMode := fmt.Sprintf("container:%v", podInfraContainerID)
-		_, err = dm.runContainerInPod(pod, container, namespaceMode, namespaceMode)
-		dm.updateReasonCache(pod, container, err)
-		if err != nil {
-			// TODO(bburns) : Perhaps blacklist a container after N failures?
-			glog.Errorf("Error running pod %q container %q: %v", kubecontainer.GetPodFullName(pod), container.Name, err)
-			continue
-		}
-		// Successfully started the container; clear the entry in the failure
-		// reason cache.
-		dm.clearReasonCache(pod, container)
 	}
 
+	return nil
+}
+
+func (dm *DockerManager) RestartContainers(pod *api.Pod, runningPod kubecontainer.Pod, containerNames []string, podStatus api.PodStatus, pullSecrets []api.Secret, backOff *util.Backoff) error {
+	podFullName := kubecontainer.GetPodFullName(pod)
+
+	// Index of containers to restart.
+	var containersToRestart map[string]*api.Container
+	var podInfraContainerID kubeletTypes.DockerID
+	if podInfraContainer := runningPod.FindContainerByName(PodInfraContainerName); podInfraContainer != nil {
+		podInfraContainerID = kubeletTypes.DockerID(podInfraContainer.ID)
+		containersToRestart = make(map[string]*api.Container, len(containerNames))
+		for _, name := range containerNames {
+			containersToRestart[name] = nil
+		}
+		for _, c := range pod.Spec.Containers {
+			if _, shouldRestart := containersToRestart[c.Name]; shouldRestart {
+				containersToRestart[c.Name] = &c
+			}
+		}
+	} else {
+		glog.V(2).Infof("Need to restart pod infra container for %q because it is not found", podFullName)
+
+		// All containers must be restarted if the Infra container goes down.
+		containersToRestart = make(map[string]*api.Container, len(pod.Spec.Containers))
+		for _, c := range pod.Spec.Containers {
+			containersToRestart[c.Name] = &c
+		}
+
+		glog.V(4).Infof("Creating pod infra container for %q", podFullName)
+		var err error
+		podInfraContainerID, err = dm.createPodInfraContainer(pod)
+		if err != nil {
+			glog.Errorf("Failed to create pod infra container: %v; Not restarting pod %q", err, podFullName)
+			return err
+		}
+	}
+
+	hadErr := false
+	// Kill any containers in this pod which are specified as ones to restart.
+	for _, c := range runningPod.Containers {
+		if podContainer, shouldRestart := containersToRestart[c.Name]; shouldRestart {
+			glog.V(3).Infof("Killing unwanted container %+v", c)
+			err := dm.KillContainerInPod(c.ID, podContainer, pod)
+			if err != nil {
+				glog.Errorf("Error killing container: %v", err)
+				hadErr = true
+			}
+		}
+	}
+
+	// Start the containers.
+	for _, container := range containersToRestart {
+		if dm.doBackOff(pod, container, podStatus, backOff) {
+			glog.V(4).Infof("Backing Off restarting container %+v in pod %v", container, podFullName)
+			continue
+		}
+
+		err := dm.startContainer(pod, container, pullSecrets, podInfraContainerID)
+		if err != nil {
+			glog.Errorf("Error starting container: %v", err)
+			hadErr = true
+		}
+	}
+
+	if hadErr {
+		return errors.New("Not all containers were successfully restarted.")
+	}
+	return nil
+}
+
+func (dm *DockerManager) startContainer(pod *api.Pod, container *api.Container, pullSecrets []api.Secret, podInfraContainerID kubeletTypes.DockerID) error {
+	glog.V(4).Infof("Creating container %+v in pod %v", container, kubecontainer.GetPodFullName(pod))
+	err := dm.imagePuller.PullImage(pod, container, pullSecrets)
+	dm.updateReasonCache(pod, container, err)
+	if err != nil {
+		glog.Warningf("Failed to pull image %q from pod %q and container %q: %v", container.Image, kubecontainer.GetPodFullName(pod), container.Name, err)
+		return err
+	}
+
+	if container.SecurityContext != nil && container.SecurityContext.RunAsNonRoot {
+		err := dm.verifyNonRoot(container)
+		dm.updateReasonCache(pod, container, err)
+		if err != nil {
+			glog.Errorf("Error running pod %q container %q: %v", kubecontainer.GetPodFullName(pod), container.Name, err)
+			return err
+		}
+	}
+
+	namespaceMode := fmt.Sprintf("container:%v", podInfraContainerID)
+	_, err = dm.runContainerInPod(pod, container, namespaceMode, namespaceMode)
+	dm.updateReasonCache(pod, container, err)
+	if err != nil {
+		// TODO(bburns) : Perhaps blacklist a container after N failures?
+		glog.Errorf("Error running pod %q container %q: %v", kubecontainer.GetPodFullName(pod), container.Name, err)
+		return err
+	}
+	// Successfully started the container; clear the entry in the failure
+	// reason cache.
+	dm.clearReasonCache(pod, container)
 	return nil
 }
 

@@ -21,7 +21,6 @@ import (
 	"k8s.io/kubernetes/pkg/client/unversioned/record"
 	kubecontainer "k8s.io/kubernetes/pkg/kubelet/container"
 	"k8s.io/kubernetes/pkg/kubelet/network"
-	"k8s.io/kubernetes/pkg/kubelet/prober"
 	kubeletTypes "k8s.io/kubernetes/pkg/kubelet/types"
 	"k8s.io/kubernetes/pkg/util/oom"
 	"k8s.io/kubernetes/pkg/util/procfs"
@@ -48,6 +47,5 @@ func NewFakeDockerManager(
 		burst, containerLogsDir, osInterface, networkPlugin, generator, httpClient, &NativeExecHandler{},
 		fakeOomAdjuster, fakeProcFs)
 	dm.dockerPuller = &FakeDockerPuller{}
-	dm.prober = prober.New(nil, readinessManager, containerRefManager, recorder)
 	return dm
 }

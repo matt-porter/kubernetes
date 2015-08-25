@@ -35,7 +35,9 @@ type PodWorkers interface {
 	ForgetWorker(uid types.UID)
 }
 
+// TODO: Encapsulate these in an interface
 type syncPodFnType func(*api.Pod, *api.Pod, kubecontainer.Pod, SyncPodType) error
+type probePodFnType func(*api.Pod, kubecontainer.Pod) error
 
 type podWorkers struct {
 	// Protects all per worker fields.
@@ -59,8 +61,16 @@ type podWorkers struct {
 	// different pods at the same time.
 	syncPodFn syncPodFnType
 
+	// This function is run to probe the desired pod container, and restart it as necessary.
+	// NOTE: This function has to be thread-safe - it can be called for
+	// different pods at the same time.
+	probePodFn probePodFnType
+
 	// The EventRecorder to use
 	recorder record.EventRecorder
+
+	// Interval to probe pods at.
+	probeInterval time.Duration
 }
 
 type workUpdate struct {
@@ -78,45 +88,77 @@ type workUpdate struct {
 }
 
 func newPodWorkers(runtimeCache kubecontainer.RuntimeCache, syncPodFn syncPodFnType,
-	recorder record.EventRecorder) *podWorkers {
+	probePodFn probePodFnType, recorder record.EventRecorder, probeInterval time.Duration) *podWorkers {
 	return &podWorkers{
 		podUpdates:                map[types.UID]chan workUpdate{},
 		isWorking:                 map[types.UID]bool{},
 		lastUndeliveredWorkUpdate: map[types.UID]workUpdate{},
 		runtimeCache:              runtimeCache,
 		syncPodFn:                 syncPodFn,
+		probePodFn:                probePodFn,
 		recorder:                  recorder,
+		probeInterval:             probeInterval,
 	}
 }
 
-func (p *podWorkers) managePodLoop(podUpdates <-chan workUpdate) {
+func (p *podWorkers) managePodLoop(initialPod *api.Pod) {
+	// FIXME: Should we keep all this state in a struct? (podWorker)
+	pod := initialPod
 	var minRuntimeCacheTime time.Time
-	for newWork := range podUpdates {
-		func() {
-			defer p.checkForUpdates(newWork.pod.UID, newWork.updateCompleteFn)
-			// We would like to have the state of the containers from at least
-			// the moment when we finished the previous processing of that pod.
-			if err := p.runtimeCache.ForceUpdateIfOlder(minRuntimeCacheTime); err != nil {
-				glog.Errorf("Error updating the container runtime cache: %v", err)
+	podUpdates, exists := p.podUpdates[pod.UID]
+	if !exists {
+		glog.Errorf("Update channel not found.")
+		return
+	}
+
+	probeTimer := time.Tick(p.probeInterval)
+	for {
+		select {
+		case u, ok := <-podUpdates:
+			if !ok {
+				glog.Errorf("Update channel is closed. Exiting the worker loop.")
 				return
 			}
+
+			func() {
+				defer p.checkForUpdates(u.pod.UID, u.updateCompleteFn)
+				// We would like to have the state of the containers from at least
+				// the moment when we finished the previous processing of that pod.
+				if err := p.runtimeCache.ForceUpdateIfOlder(minRuntimeCacheTime); err != nil {
+					glog.Errorf("Error updating the container runtime cache: %v", err)
+					return
+				}
+				pods, err := p.runtimeCache.GetPods()
+				if err != nil {
+					glog.Errorf("Error getting pods while syncing pod: %v", err)
+					return
+				}
+
+				err = p.syncPodFn(u.pod, u.mirrorPod,
+					kubecontainer.Pods(pods).FindPodByID(u.pod.UID), u.updateType)
+				if err != nil {
+					glog.Errorf("Error syncing pod %s, skipping: %v", u.pod.UID, err)
+					p.recorder.Eventf(u.pod, "FailedSync", "Error syncing pod, skipping: %v", err)
+					return
+				}
+
+				pod = u.pod
+				minRuntimeCacheTime = time.Now()
+
+				u.updateCompleteFn()
+			}()
+
+		case <-probeTimer:
 			pods, err := p.runtimeCache.GetPods()
 			if err != nil {
-				glog.Errorf("Error getting pods while syncing pod: %v", err)
+				glog.Errorf("Error getting pods while probing pod: %v", err)
 				return
 			}
 
-			err = p.syncPodFn(newWork.pod, newWork.mirrorPod,
-				kubecontainer.Pods(pods).FindPodByID(newWork.pod.UID), newWork.updateType)
-			if err != nil {
-				glog.Errorf("Error syncing pod %s, skipping: %v", newWork.pod.UID, err)
-				p.recorder.Eventf(newWork.pod, "FailedSync", "Error syncing pod, skipping: %v", err)
-				return
+			if err := p.probePodFn(pod, kubecontainer.Pods(pods).FindPodByID(pod.UID)); err != nil {
+				glog.Errorf("Error probing pod %s: %v", pod.UID, err)
 			}
-			minRuntimeCacheTime = time.Now()
-
-			newWork.updateCompleteFn()
-		}()
+		}
 	}
 }
 
@@ -151,7 +193,7 @@ func (p *podWorkers) UpdatePod(pod *api.Pod, mirrorPod *api.Pod, updateComplete 
 		updateType = SyncPodCreate
 		go func() {
 			defer util.HandleCrash()
-			p.managePodLoop(podUpdates)
+			p.managePodLoop(pod)
 		}()
 	}
 	if !p.isWorking[pod.UID] {
