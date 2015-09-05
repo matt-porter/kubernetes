@@ -42,7 +42,6 @@ import (
 	kubecontainer "k8s.io/kubernetes/pkg/kubelet/container"
 	"k8s.io/kubernetes/pkg/kubelet/prober"
 	kubeletUtil "k8s.io/kubernetes/pkg/kubelet/util"
-	"k8s.io/kubernetes/pkg/probe"
 	"k8s.io/kubernetes/pkg/securitycontext"
 	"k8s.io/kubernetes/pkg/types"
 	"k8s.io/kubernetes/pkg/util"
@@ -93,8 +92,7 @@ type runtime struct {
 	containerRefManager *kubecontainer.RefManager
 	generator           kubecontainer.RunContainerOptionsGenerator
 	recorder            record.EventRecorder
-	prober              prober.Prober
-	readinessManager    *kubecontainer.ReadinessManager
+	probeManager        prober.Manager
 	volumeGetter        volumeGetter
 	imagePuller         kubecontainer.ImagePuller
 }
@@ -113,7 +111,7 @@ func New(config *Config,
 	generator kubecontainer.RunContainerOptionsGenerator,
 	recorder record.EventRecorder,
 	containerRefManager *kubecontainer.RefManager,
-	readinessManager *kubecontainer.ReadinessManager,
+	probeManager prober.Manager,
 	volumeGetter volumeGetter) (kubecontainer.Runtime, error) {
 
 	systemdVersion, err := getSystemdVersion()
@@ -151,10 +149,9 @@ func New(config *Config,
 		containerRefManager: containerRefManager,
 		generator:           generator,
 		recorder:            recorder,
-		readinessManager:    readinessManager,
+		probeManager:        probeManager,
 		volumeGetter:        volumeGetter,
 	}
-	rkt.prober = prober.New(rkt, readinessManager, containerRefManager, recorder)
 	rkt.imagePuller = kubecontainer.NewImagePuller(recorder, rkt)
 
 	// Test the rkt version.
@@ -717,6 +714,11 @@ func (r *runtime) RunPod(pod *api.Pod, pullSecrets []api.Secret) error {
 
 	r.generateEvents(runtimePod, "Started", nil)
 
+	// Notify probes of the new container ID.
+	for _, c := range runtimePod.Containers {
+		r.probeManager.HandleNewContainer(*c)
+	}
+
 	return nil
 }
 
@@ -987,7 +989,7 @@ func (r *runtime) SyncPod(pod *api.Pod, runningPod kubecontainer.Pod, podStatus 
 
 		c := runningPod.FindContainerByName(container.Name)
 		if c == nil {
-			if kubecontainer.ShouldContainerBeRestarted(&container, pod, &podStatus, r.readinessManager) {
+			if kubecontainer.ShouldContainerBeRestarted(&container, pod, &podStatus) {
 				glog.V(3).Infof("Container %+v is dead, but RestartPolicy says that we should restart it.", container)
 				// TODO(yifan): Containers in one pod are fate-sharing at this moment, see:
 				// https://github.com/appc/spec/issues/276.
@@ -1007,17 +1009,13 @@ func (r *runtime) SyncPod(pod *api.Pod, runningPod kubecontainer.Pod, podStatus 
 			break
 		}
 
-		result, err := r.prober.Probe(pod, podStatus, container, string(c.ID), c.Created)
 		// TODO(vmarmol): examine this logic.
-		if err == nil && result != probe.Success {
-			glog.Infof("Pod %q container %q is unhealthy (probe result: %v), it will be killed and re-created.", podFullName, container.Name, result)
+		if r.probeManager.GetLiveness(c.ID) == prober.Failure {
+			glog.Infof("Pod %q container %q is unhealthy, it will be killed and re-created.", podFullName, container.Name)
 			restartPod = true
 			break
 		}
 
-		if err != nil {
-			glog.V(2).Infof("Probe container %q failed: %v", container.Name, err)
-		}
 		delete(unidentifiedContainers, c.ID)
 	}
 
@@ -1027,17 +1025,12 @@ func (r *runtime) SyncPod(pod *api.Pod, runningPod kubecontainer.Pod, podStatus 
 	}
 
 	if restartPod {
-		return r.RestartContainers(pod, runningPod, []string{}, api.PodStatus{}, pullSecrets, backOff)
-	}
-	return nil
-}
-
-func (r *runtime) RestartContainers(pod *api.Pod, runningPod kubecontainer.Pod, containerNames []string, _ api.PodStatus, pullSecrets []api.Secret, _ *util.Backoff) error {
-	if err := r.KillPod(pod, runningPod); err != nil {
-		return err
-	}
-	if err := r.RunPod(pod, pullSecrets); err != nil {
-		return err
+		if err := r.KillPod(pod, runningPod); err != nil {
+			return err
+		}
+		if err := r.RunPod(pod, pullSecrets); err != nil {
+			return err
+		}
 	}
 	return nil
 }

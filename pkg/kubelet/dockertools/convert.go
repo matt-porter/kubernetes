@@ -39,6 +39,7 @@ func toRuntimeContainer(c *docker.APIContainers) (*kubecontainer.Container, erro
 	}
 	return &kubecontainer.Container{
 		ID:      types.UID(c.ID),
+		PodUID:  dockerName.PodUID,
 		Name:    dockerName.ContainerName,
 		Image:   c.Image,
 		Hash:    hash,

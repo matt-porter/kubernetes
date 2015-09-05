@@ -164,22 +164,6 @@ func (f *FakeRuntime) SyncPod(pod *api.Pod, _ Pod, _ api.PodStatus, _ []api.Secr
 	return f.Err
 }
 
-func (f *FakeRuntime) RestartContainers(pod *api.Pod, runningPod Pod, containerNames []string, _ api.PodStatus, _ []api.Secret, _ *util.Backoff) error {
-	f.Lock()
-	defer f.Unlock()
-
-	f.CalledFunctions = append(f.CalledFunctions, "RestartContainers")
-	for _, c := range pod.Spec.Containers {
-		for _, containerName := range containerNames {
-			if c.Name == containerName {
-				f.KilledContainers = append(f.KilledContainers, c.Name)
-				f.StartedContainers = append(f.StartedContainers, c.Name)
-			}
-		}
-	}
-	return f.Err
-}
-
 func (f *FakeRuntime) KillPod(pod *api.Pod, runningPod Pod) error {
 	f.Lock()
 	defer f.Unlock()

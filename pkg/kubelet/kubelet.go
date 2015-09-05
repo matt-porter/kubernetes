@@ -57,7 +57,6 @@ import (
 	kubeletTypes "k8s.io/kubernetes/pkg/kubelet/types"
 	kubeletUtil "k8s.io/kubernetes/pkg/kubelet/util"
 	"k8s.io/kubernetes/pkg/labels"
-	"k8s.io/kubernetes/pkg/probe"
 	"k8s.io/kubernetes/pkg/runtime"
 	"k8s.io/kubernetes/pkg/types"
 	"k8s.io/kubernetes/pkg/util"
@@ -248,12 +247,12 @@ func NewMainKubelet(
 		return nil, fmt.Errorf("failed to initialize disk manager: %v", err)
 	}
 	statusManager := status.NewManager(kubeClient)
-	readinessManager := kubecontainer.NewReadinessManager()
 	containerRefManager := kubecontainer.NewRefManager()
 
 	volumeManager := newVolumeManager()
 
 	oomWatcher := NewOOMWatcher(cadvisorInterface, recorder)
+	syncChan := make(chan struct{})
 
 	klet := &Kubelet{
 		hostname:                       hostname,
@@ -263,7 +262,7 @@ func NewMainKubelet(
 		rootDirectory:                  rootDirectory,
 		resyncInterval:                 resyncInterval,
 		containerRefManager:            containerRefManager,
-		readinessManager:               readinessManager,
+		syncChan:                       syncChan,
 		httpClient:                     &http.Client{},
 		sourcesReady:                   sourcesReady,
 		registerNode:                   registerNode,
@@ -321,7 +320,7 @@ func NewMainKubelet(
 		klet.containerRuntime = dockertools.NewDockerManager(
 			dockerClient,
 			recorder,
-			readinessManager,
+			klet.probeManager, // FIXME: probeManager is nil!
 			containerRefManager,
 			machineInfo,
 			podInfraContainerImage,
@@ -347,7 +346,7 @@ func NewMainKubelet(
 			klet,
 			recorder,
 			containerRefManager,
-			readinessManager,
+			klet.probeManager,
 			klet.volumeManager)
 		if err != nil {
 			return nil, err
@@ -382,14 +381,21 @@ func NewMainKubelet(
 
 	klet.runner = klet.containerRuntime
 	klet.podManager = newBasicPodManager(klet.kubeClient)
-	klet.prober = prober.New(klet.runner, readinessManager, containerRefManager, recorder)
+
+	klet.probeManager = prober.NewManager(
+		syncChan,
+		klet.resyncInterval,
+		klet.statusManager,
+		recorder,
+		containerRefManager,
+		klet.runner)
 
 	runtimeCache, err := kubecontainer.NewRuntimeCache(klet.containerRuntime)
 	if err != nil {
 		return nil, err
 	}
 	klet.runtimeCache = runtimeCache
-	klet.podWorkers = newPodWorkers(runtimeCache, klet.syncPod, klet.probePod, recorder, klet.resyncInterval)
+	klet.podWorkers = newPodWorkers(runtimeCache, klet.syncPod, recorder)
 
 	metrics.Register(runtimeCache)
 
@@ -484,11 +490,11 @@ type Kubelet struct {
 	// Network plugin.
 	networkPlugin network.NetworkPlugin
 
-	// Container readiness state manager.
-	readinessManager *kubecontainer.ReadinessManager
+	// Handles container probing
+	probeManager prober.Manager
 
-	// Health check prober.
-	prober prober.Prober
+	// Channel for components to request a pod sync
+	syncChan chan struct{}
 
 	// How long to keep idle streaming command execution/port forwarding
 	// connections open before terminating them
@@ -1378,43 +1384,6 @@ func (kl *Kubelet) syncPod(pod *api.Pod, mirrorPod *api.Pod, runningPod kubecont
 	return nil
 }
 
-// probePod probes (liveness and readiness) the containers in the pod, and restarts
-func (kl *Kubelet) probePod(pod *api.Pod, runningPod kubecontainer.Pod) error {
-	podStatus, err := kl.generatePodStatus(pod)
-	if err != nil {
-		glog.Errorf("Unable to get status for pod %q: %v", pod.UID, err)
-		return err
-	}
-
-	// Names of containers requiring restart.
-	containersToRestart := []string{}
-	for _, container := range pod.Spec.Containers {
-		runningContainer := runningPod.FindContainerByName(container.Name)
-		result, err := kl.prober.Probe(pod, podStatus, container,
-			string(runningContainer.ID), runningContainer.Created)
-		if err != nil {
-			glog.Errorf("Failed to proby container %q: %v", container.Name, err)
-		} else if result == probe.Success {
-			glog.V(4).Infof("probe success: %q", container.Name)
-		} else {
-			glog.Infof("pod %q container %q is unhealthy (probe result: %v), it will be killed and re-created.",
-				kubecontainer.GetPodFullName(pod), container.Name, result)
-			if kubecontainer.ShouldContainerBeRestarted(&container, pod, &podStatus, kl.readinessManager) {
-				containersToRestart = append(containersToRestart, container.Name)
-			}
-		}
-	}
-
-	if len(containersToRestart) == 0 {
-		return nil
-	}
-	pullSecrets, err := kl.getPullSecretsForPod(pod)
-	if err != nil {
-		return err
-	}
-	return kl.containerRuntime.RestartContainers(pod, runningPod, containersToRestart, podStatus, pullSecrets, kl.backOff)
-}
-
 // getPullSecretsForPod inspects the Pod and retrieves the referenced pull secrets
 // TODO duplicate secrets are being retrieved multiple times and there is no cache.  Creating and using a secret manager interface will make this easier to address.
 func (kl *Kubelet) getPullSecretsForPod(pod *api.Pod) ([]api.Secret, error) {
@@ -1970,6 +1939,10 @@ func (kl *Kubelet) syncLoopIteration(updates <-chan PodUpdate, handler SyncHandl
 	case <-time.After(kl.resyncInterval):
 		// Periodically syncs all the pods and performs cleanup tasks.
 		glog.V(4).Infof("SyncLoop (periodic sync)")
+		handler.HandlePodSyncs(kl.podManager.GetPods())
+	case <-kl.syncChan:
+		// Out of band sync requested.
+		glog.V(4).Infof("SyncLoop (requested)")
 		handler.HandlePodSyncs(kl.podManager.GetPods())
 	}
 	kl.syncLoopMonitor.Store(time.Now())
@@ -2619,7 +2592,8 @@ func (kl *Kubelet) generatePodStatus(pod *api.Pod) (api.PodStatus, error) {
 	for _, c := range spec.Containers {
 		for i, st := range podStatus.ContainerStatuses {
 			if st.Name == c.Name {
-				ready := st.State.Running != nil && kl.readinessManager.GetReadiness(kubecontainer.TrimRuntimePrefix(st.ContainerID))
+				ready := st.State.Running != nil &&
+					kl.probeManager.GetReadiness(types.UID(st.ContainerID)) == prober.Success
 				podStatus.ContainerStatuses[i].Ready = ready
 				break
 			}

@@ -80,8 +80,6 @@ type Runtime interface {
 	// stream the log. Set 'follow' to false and specify the number of lines (e.g.
 	// "100" or "all") to tail the log.
 	GetContainerLogs(pod *api.Pod, containerID, tail string, follow bool, stdout, stderr io.Writer) (err error)
-	// RestartContainers kills specified containers if necessary, and then starts all the specified containers.
-	RestartContainers(pod *api.Pod, runningPod Pod, containerNames []string, podStatus api.PodStatus, pullSecrets []api.Secret, backOff *util.Backoff) error
 	// ContainerCommandRunner encapsulates the command runner interfaces for testability.
 	ContainerCommandRunner
 	// ContainerAttach encapsulates the attaching to containers for testability
@@ -180,6 +178,8 @@ type Container struct {
 	// The timestamp of the creation time of the container.
 	// TODO(yifan): Consider to move it to api.ContainerStatus.
 	Created int64
+	// UID of the API Pod, used to uniquly identify this container.
+	PodUID types.UID
 }
 
 // Basic information about a container image.
